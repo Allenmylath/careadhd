@@ -1,0 +1,4 @@
+pipecat-ai[cartesia,openai,silero,gladia,noisereduce]
+python-dotenv
+loguru
+boto3
