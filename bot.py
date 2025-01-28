@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Optional
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import EndFrame, LLMMessagesFrame
@@ -10,43 +11,47 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.openai import OpenAILLMService
 from pipecat.services.gladia import GladiaSTTService
-from awswebsocketserver import (
-    LambdaTransport,
-    LambdaWebSocketParams,
-)
-from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.audio.filters.noisereduce_filter import NoisereduceFilter
 
 from loguru import logger
-
 from dotenv import load_dotenv
 
-from text import text
+from apigwtransport import (
+    APIGatewayTransport,
+    APIGatewayTransportParams,
+)
 
+from text import text
 
 load_dotenv(override=True)
 
 logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
-
-async def run_bot(ws_interface, stream_sid):
-    """Run the bot with Lambda WebSocket interface"""
-    # Initialize transport with Lambda WebSocket interface
-    transport = LambdaTransport(
-        ws_interface,
-        params=LambdaWebSocketParams(
+async def run_bot(connection_id: Optional[str] = None, stream_sid: str = "default"):
+    """Run the bot with API Gateway interface"""
+    # Initialize transport with API Gateway
+    transport = APIGatewayTransport(
+        params=APIGatewayTransportParams(
             audio_out_enabled=True,
             add_wav_header=False,
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
             vad_audio_passthrough=True,
-            serializer=TwilioFrameSerializer(stream_sid),
             audio_in_filter=NoisereduceFilter(),
+            api_gateway_endpoint=os.getenv("API_GATEWAY_ENDPOINT"),
+            serializer=TwilioFrameSerializer(stream_sid=stream_sid)
         ),
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4")
+    # Set initial connection if provided
+    if connection_id:
+        await transport.set_connection(connection_id)
+
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        model="gpt-4"
+    )
 
     stt = GladiaSTTService(
         api_key=os.getenv("GLADIA_API_KEY"),
@@ -89,12 +94,12 @@ async def run_bot(ws_interface, stream_sid):
 
     pipeline = Pipeline(
         [
-            transport.input(),  # WebSocket input from client
+            transport.input(),  # API Gateway input from client
             stt,  # Speech-To-Text
             context_aggregator.user(),
             llm,  # LLM
             tts,  # Text-To-Speech
-            transport.output(),  # WebSocket output to client
+            transport.output(),  # API Gateway output to client
             context_aggregator.assistant(),
         ]
     )
@@ -102,7 +107,7 @@ async def run_bot(ws_interface, stream_sid):
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
     @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
+    async def on_client_connected():
         # Kick off the conversation
         messages.append(
             {"role": "system", "content": "Please introduce yourself to the user."}
@@ -110,8 +115,9 @@ async def run_bot(ws_interface, stream_sid):
         await task.queue_frames([LLMMessagesFrame(messages)])
 
     @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
+    async def on_client_disconnected():
         await task.queue_frames([EndFrame()])
 
     runner = PipelineRunner(handle_sigint=False)
     await runner.run(task)
+
