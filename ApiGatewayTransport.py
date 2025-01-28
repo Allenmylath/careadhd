@@ -84,6 +84,9 @@ class APIGatewayOutputTransport(BaseOutputTransport):
         self._apigw_client = apigw_client
         self._current_connection_id: Optional[str] = None
         self._audio_buffer = bytes()
+        # Add timing control
+        self._send_interval = (self._audio_chunk_size / self._params.audio_out_sample_rate) / 2
+        self._next_send_time = 0
 
     async def set_client_connection(self, connection_id: Optional[str]):
         """Set or clear the current client connection"""
@@ -91,17 +94,26 @@ class APIGatewayOutputTransport(BaseOutputTransport):
             logger.warning("Only one client allowed, using new connection")
         self._current_connection_id = connection_id
         self._audio_buffer = bytes()
+        self._next_send_time = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartInterruptionFrame):
+            await self._send_frame(frame)
+            self._next_send_time = 0
 
     async def write_raw_audio_frames(self, frames: bytes):
-        """Send audio frames to the current client through API Gateway"""
+        """Send audio frames to the current client through API Gateway with timing control"""
         if not self._current_connection_id:
+            # Simulate audio playback with sleep even when no client is connected
+            await self._write_audio_sleep()
             return
 
         try:
             self._audio_buffer += frames
-            while len(self._audio_buffer) >= self._params.audio_frame_size:
+            while len(self._audio_buffer) >= self._audio_chunk_size:
                 frame = AudioRawFrame(
-                    audio=self._audio_buffer[:self._params.audio_frame_size],
+                    audio=self._audio_buffer[:self._audio_chunk_size],
                     sample_rate=self._params.audio_out_sample_rate,
                     num_channels=self._params.audio_out_channels,
                 )
@@ -112,11 +124,32 @@ class APIGatewayOutputTransport(BaseOutputTransport):
                         serialized.encode() if isinstance(serialized, str) else serialized
                     )
 
-                self._audio_buffer = self._audio_buffer[self._params.audio_frame_size:]
+                self._audio_buffer = self._audio_buffer[self._audio_chunk_size:]
+                
+                # Add sleep to control timing
+                await self._write_audio_sleep()
 
         except Exception as e:
             logger.error(f"Error sending frame: {e}")
             await self.set_client_connection(None)
+
+    async def _write_audio_sleep(self):
+        """Simulate audio playback timing"""
+        current_time = time.monotonic()
+        sleep_duration = max(0, self._next_send_time - current_time)
+        await asyncio.sleep(sleep_duration)
+        if sleep_duration == 0:
+            self._next_send_time = time.monotonic() + self._send_interval
+        else:
+            self._next_send_time += self._send_interval
+
+    async def _send_frame(self, frame: Frame):
+        """Send a frame through API Gateway"""
+        serialized = self._params.serializer.serialize(frame)
+        if serialized and self._current_connection_id:
+            await self._send_to_connection(
+                serialized.encode() if isinstance(serialized, str) else serialized
+            )
 
     async def _send_to_connection(self, data: bytes):
         """Send data through API Gateway"""
@@ -132,7 +165,6 @@ class APIGatewayOutputTransport(BaseOutputTransport):
         except Exception as e:
             logger.error(f"Failed to send to connection: {e}")
             raise
-
 
 class APIGatewayTransport(BaseTransport):
     def __init__(
