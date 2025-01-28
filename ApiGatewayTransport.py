@@ -144,6 +144,7 @@ class APIGatewayTransport(BaseTransport):
     ):
         super().__init__(input_name=input_name, output_name=output_name, loop=loop)
         self._params = params
+        self._current_connection_id: Optional[str] = None
         
         # Initialize API Gateway client
         self._apigw_client = boto3.client('apigatewaymanagementapi',
@@ -178,6 +179,14 @@ class APIGatewayTransport(BaseTransport):
                 name=self._output_name
             )
         return self._output
+
+    async def set_connection(self, connection_id: Optional[str]):
+        """Set or clear the current connection for both input and output transports"""
+        self._current_connection_id = connection_id
+        if self._input:
+            self._input._current_connection_id = connection_id
+        if self._output:
+            await self._output.set_client_connection(connection_id)
 
     async def _on_client_connected(self):
         if self._output:
