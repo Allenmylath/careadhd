@@ -12,7 +12,7 @@ from pipecat.frames.frames import (
     StartFrame,
 )
 from pipecat.serializers.base_serializer import FrameSerializer
-from pipecat.serializers.protobuf import ProtobufFrameSerializer
+from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
@@ -23,7 +23,7 @@ from loguru import logger
 class APIGatewayTransportParams(TransportParams):
     add_wav_header: bool = False
     audio_frame_size: int = 6400  # 200ms
-    serializer: FrameSerializer = ProtobufFrameSerializer()
+    serializer: FrameSerializer = TwilioFrameSerializer(stream_sid="default")  # Changed from ProtobufFrameSerializer
     api_gateway_endpoint: str
 
 
@@ -106,9 +106,11 @@ class APIGatewayOutputTransport(BaseOutputTransport):
                     num_channels=self._params.audio_out_channels,
                 )
 
-                proto = self._params.serializer.serialize(frame)
-                if proto:
-                    await self._send_to_connection(proto)
+                serialized = self._params.serializer.serialize(frame)
+                if serialized:
+                    await self._send_to_connection(
+                        serialized.encode() if isinstance(serialized, str) else serialized
+                    )
 
                 self._audio_buffer = self._audio_buffer[self._params.audio_frame_size:]
 
