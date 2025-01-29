@@ -30,12 +30,7 @@ class APIGatewayTransportParams(TransportParams):
     add_wav_header: bool = False
     serializer: FrameSerializer = TwilioFrameSerializer(stream_sid="default")
     api_gateway_endpoint: str
-
-
-class APIGatewayCallbacks(BaseModel):
-    on_client_connected: Callable[[], Awaitable[None]]
-    on_client_disconnected: Callable[[], Awaitable[None]]
-
+    connection_id: str  # Add connection_id as a required parameter
 
 class APIGatewayInputTransport(BaseInputTransport):
     def __init__(
@@ -49,24 +44,15 @@ class APIGatewayInputTransport(BaseInputTransport):
         self._params = params
         self._apigw_client = apigw_client
         self._callbacks = callbacks
-        self._current_connection_id: Optional[str] = None
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
         await self._callbacks.on_client_connected()
 
-    async def stop(self, frame: EndFrame):
-        await super().stop(frame)
-        self._current_connection_id = None
-
-    async def cancel(self, frame: CancelFrame):
-        await super().cancel(frame)
-        self._current_connection_id = None
-
     async def handle_client_message(self, connection_id: str, message: bytes):
         """Handle incoming message from API Gateway"""
-        if connection_id != self._current_connection_id:
-            logger.warning("Received message from non-active connection")
+        if connection_id != self._params.connection_id:
+            logger.warning(f"Received message from wrong connection: {connection_id}")
             return
 
         frame = self._params.serializer.deserialize(message)
@@ -78,7 +64,6 @@ class APIGatewayInputTransport(BaseInputTransport):
         else:
             await self.push_frame(frame)
 
-
 class APIGatewayOutputTransport(BaseOutputTransport):
     def __init__(
         self, params: APIGatewayTransportParams, apigw_client: BaseClient, **kwargs
@@ -86,18 +71,9 @@ class APIGatewayOutputTransport(BaseOutputTransport):
         super().__init__(params, **kwargs)
         self._params = params
         self._apigw_client = apigw_client
-        self._current_connection_id: Optional[str] = None
-        # Add timing control
         self._send_interval = (
             self._audio_chunk_size / self._params.audio_out_sample_rate
         ) / 2
-        self._next_send_time = 0
-
-    async def set_client_connection(self, connection_id: Optional[str]):
-        """Set or clear the current client connection"""
-        if self._current_connection_id and connection_id:
-            logger.warning("Only one client allowed, using new connection")
-        self._current_connection_id = connection_id
         self._next_send_time = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -107,14 +83,8 @@ class APIGatewayOutputTransport(BaseOutputTransport):
             self._next_send_time = 0
 
     async def write_raw_audio_frames(self, frames: bytes):
-        """Send audio frames to the current client through API Gateway with timing control"""
-        if not self._current_connection_id:
-            # Simulate audio playback with sleep even when no client is connected
-            await self._write_audio_sleep()
-            return
-
+        """Send audio frames through API Gateway with timing control"""
         try:
-            # Create frame directly from incoming bytes, like the WebSocket version
             frame = OutputAudioRawFrame(
                 audio=frames,
                 sample_rate=self._params.audio_out_sample_rate,
@@ -147,7 +117,7 @@ class APIGatewayOutputTransport(BaseOutputTransport):
 
         except Exception as e:
             logger.error(f"Error sending frame: {e}")
-            await self.set_client_connection(None)
+            raise
 
     async def _write_audio_sleep(self):
         """Simulate audio playback timing"""
@@ -162,26 +132,22 @@ class APIGatewayOutputTransport(BaseOutputTransport):
     async def _send_frame(self, frame: Frame):
         """Send a frame through API Gateway"""
         serialized = self._params.serializer.serialize(frame)
-        if serialized and self._current_connection_id:
+        if serialized:
             await self._send_to_connection(
                 serialized.encode() if isinstance(serialized, str) else serialized
             )
 
     async def _send_to_connection(self, data: bytes):
         """Send data through API Gateway"""
-        if not self._current_connection_id:
-            return
-
         try:
             await asyncio.to_thread(
                 self._apigw_client.post_to_connection,
-                ConnectionId=self._current_connection_id,
+                ConnectionId=self._params.connection_id,
                 Data=data,
             )
         except Exception as e:
             logger.error(f"Failed to send to connection: {e}")
             raise
-
 
 class APIGatewayTransport(BaseTransport):
     def __init__(
@@ -193,7 +159,6 @@ class APIGatewayTransport(BaseTransport):
     ):
         super().__init__(input_name=input_name, output_name=output_name, loop=loop)
         self._params = params
-        self._current_connection_id: Optional[str] = None
 
         # Initialize API Gateway client
         self._apigw_client = boto3.client(
@@ -220,7 +185,6 @@ class APIGatewayTransport(BaseTransport):
                 callbacks=self._callbacks,
                 name=self._input_name,
             )
-
         return self._input
 
     def output(self) -> APIGatewayOutputTransport:
@@ -230,23 +194,8 @@ class APIGatewayTransport(BaseTransport):
             )
         return self._output
 
-    async def set_connection(self, connection_id: Optional[str]):
-        """Set or clear the current connection for both input and output transports"""
-        self._current_connection_id = connection_id
-        if self._input:
-            self._input._current_connection_id = connection_id
-        if self._output:
-            await self._output.set_client_connection(connection_id)
-
     async def _on_client_connected(self):
-        if self._output:
-            await self._call_event_handler("on_client_connected")
-        else:
-            logger.error("APIGatewayTransport output is missing in the pipeline")
+        await self._call_event_handler("on_client_connected")
 
     async def _on_client_disconnected(self):
-        if self._output:
-            await self._output.set_client_connection(None)
-            await self._call_event_handler("on_client_disconnected")
-        else:
-            logger.error("APIGatewayTransport output is missing in the pipeline")
+        await self._call_event_handler("on_client_disconnected")
