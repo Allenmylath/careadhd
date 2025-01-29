@@ -39,14 +39,11 @@ async def run_bot(connection_id: Optional[str] = None, stream_sid: str = "defaul
             vad_analyzer=SileroVADAnalyzer(),
             vad_audio_passthrough=True,
             audio_in_filter=NoisereduceFilter(),
+            connection_id=connection_id,
             api_gateway_endpoint=os.getenv("API_GATEWAY_ENDPOINT"),
             serializer=TwilioFrameSerializer(stream_sid=stream_sid)
         ),
     )
-
-    # Set initial connection if provided
-    if connection_id:
-        await transport.set_connection(connection_id)
 
     llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
